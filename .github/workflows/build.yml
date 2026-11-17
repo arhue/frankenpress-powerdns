@@ -1,0 +1,212 @@
+name: build
+
+# Nightly: rebuild when FrankenPress or caddy-dns/powerdns has a new release. A tag that
+# already exists in GHCR is skipped, so most nights do nothing.
+on:
+  schedule:
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if the tag already exists
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths: [Dockerfile, .github/workflows/build.yml]
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/frankenpress-powerdns
+  # FrankenPress floating tags to follow. Each is resolved to the dated tag it points at.
+  VARIANTS: php-8.5-trixie
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      any: ${{ steps.resolve.outputs.any }}
+    steps:
+      - name: Resolve versions and decide what to build
+        id: resolve
+        env:
+          FORCE: ${{ github.event_name == 'push' || inputs.force == true }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          hub() { curl -fsS "https://hub.docker.com/v2/repositories/$1"; }
+
+          # Latest caddy-dns/powerdns release
+          pdns=$(git ls-remote --tags --refs https://github.com/caddy-dns/powerdns \
+                 | awk -F/ '{print $3}' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          echo "caddy-dns/powerdns: $pdns"
+
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
+          entries=()
+          for variant in $VARIANTS; do
+            # The dated tag with the same digest as the floating tag
+            digest=$(hub "bock/frankenpress/tags/$variant" | jq -r .digest)
+            dated=$(hub "bock/frankenpress/tags?page_size=100&ordering=last_updated" \
+                    | jq -r --arg d "$digest" --arg v "$variant" \
+                      '.results[] | select(.digest == $d and (.name | test("^" + $v + "-wp[0-9.]+-[0-9]{8}-[0-9]{4}$"))) | .name' \
+                    | head -1)
+            [ -n "$dated" ] || { echo "::error::no dated tag found for $variant ($digest)"; exit 1; }
+            src="bock/frankenpress:$dated"
+
+            # FrankenPHP, PHP and Caddy versions inside the image, e.g.
+            # "FrankenPHP v1.13.5 PHP 8.5.12 Caddy v2.11.9 h1:..."
+            ver=$(docker run --rm --pull always --entrypoint frankenphp "$src" version)
+            fp=$(sed -E 's/.*FrankenPHP v([0-9.]+).*/\1/' <<<"$ver")
+            php=$(sed -E 's/.*PHP ([0-9.]+).*/\1/' <<<"$ver")
+            caddy=$(sed -E 's/.*Caddy (v[0-9.]+).*/\1/' <<<"$ver")
+            distro=$(grep -oE '(trixie|bookworm)' <<<"$variant" | head -1)
+            builder="dunglas/frankenphp:${fp}-builder-php${php}-${distro}"
+            docker manifest inspect "$builder" >/dev/null \
+              || { echo "::error::builder image $builder not found"; exit 1; }
+
+            tag="${dated}-powerdns-${pdns}"
+            echo "$variant -> $src (FrankenPHP $fp, PHP $php, Caddy $caddy) => $IMAGE:$tag"
+            if [ "$FORCE" != true ] && docker manifest inspect "$IMAGE:$tag" >/dev/null 2>&1; then
+              echo "  exists, skipping"
+              continue
+            fi
+            entries+=("$(jq -nc --arg variant "$variant" --arg src "$src" --arg builder "$builder" \
+              --arg caddy "$caddy" --arg pdns "$pdns" --arg tag "$tag" --arg php "$php" \
+              '{variant:$variant, src:$src, builder:$builder, caddy:$caddy, pdns:$pdns, tag:$tag, php:$php}')")
+          done
+
+          if [ ${#entries[@]} -eq 0 ]; then
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            echo "matrix=[]" >> "$GITHUB_OUTPUT"
+          else
+            echo "any=true" >> "$GITHUB_OUTPUT"
+            echo "matrix=$(printf '%s\n' "${entries[@]}" | jq -sc .)" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.any == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        image: ${{ fromJson(needs.resolve.outputs.matrix) }}
+        platform:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.platform.arch }}
+          load: true
+          tags: test:${{ matrix.platform.arch }}
+          build-args: |
+            FRANKENPRESS=${{ matrix.image.src }}
+            FRANKENPHP_BUILDER=${{ matrix.image.builder }}
+            CADDY_BUILDER=caddy:${{ matrix.image.caddy }}-builder
+            CADDY_VERSION=${{ matrix.image.caddy }}
+            POWERDNS_VERSION=${{ matrix.image.pdns }}
+          cache-from: type=gha,scope=${{ matrix.image.variant }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.variant }}-${{ matrix.platform.arch }}
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          img=test:${{ matrix.platform.arch }}
+          modules=$(docker run --rm --entrypoint frankenphp "$img" list-modules)
+          for m in dns.providers.powerdns frankenphp http.handlers.mercure http.handlers.vulcain http.encoders.br; do
+            grep -qx "$m" <<<"$modules" || { echo "::error::module $m missing"; exit 1; }
+          done
+          php=$(docker run --rm --entrypoint php "$img" -r 'echo PHP_VERSION;')
+          [ "$php" = "${{ matrix.image.php }}" ] || { echo "::error::PHP $php, expected ${{ matrix.image.php }}"; exit 1; }
+          # Without a database WordPress answers with a redirect to its installer: PHP runs
+          c=$(docker run -d -e SERVER_NAME=:80 "$img")
+          code=000
+          for _ in $(seq 30); do
+            code=$(docker exec "$c" curl -s -o /dev/null -w '%{http_code}' http://localhost/ || true)
+            [ "$code" != 000 ] && break
+            sleep 2
+          done
+          docker logs "$c" 2>&1 | tail -20
+          docker rm -f "$c" >/dev/null
+          case "$code" in 200|301|302) echo "HTTP $code: ok" ;; *) echo "::error::HTTP $code"; exit 1 ;; esac
+
+      - name: Push by digest
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.platform.arch }}
+          build-args: |
+            FRANKENPRESS=${{ matrix.image.src }}
+            FRANKENPHP_BUILDER=${{ matrix.image.builder }}
+            CADDY_BUILDER=caddy:${{ matrix.image.caddy }}-builder
+            CADDY_VERSION=${{ matrix.image.caddy }}
+            POWERDNS_VERSION=${{ matrix.image.pdns }}
+          cache-from: type=gha,scope=${{ matrix.image.variant }}-${{ matrix.platform.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Save digest
+        run: |
+          mkdir -p digests
+          echo "${{ steps.push.outputs.digest }}" > "digests/${{ matrix.platform.arch }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.image.variant }}-${{ matrix.platform.arch }}
+          path: digests/*
+          retention-days: 1
+
+  publish:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.any == 'true'
+    strategy:
+      matrix:
+        image: ${{ fromJson(needs.resolve.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-${{ matrix.image.variant }}-*
+          merge-multiple: true
+          path: digests
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Create multi-arch tags
+        run: |
+          set -euo pipefail
+          refs=$(for f in digests/*; do echo "$IMAGE@$(cat "$f")"; done)
+          docker buildx imagetools create \
+            -t "$IMAGE:${{ matrix.image.tag }}" \
+            -t "$IMAGE:${{ matrix.image.variant }}-powerdns" \
+            $refs
+          docker buildx imagetools inspect "$IMAGE:${{ matrix.image.tag }}"
+          echo "Published $IMAGE:${{ matrix.image.tag }}" >> "$GITHUB_STEP_SUMMARY"
