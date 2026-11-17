@@ -1,4 +1,4 @@
-name: build
+name: frankenpress
 
 # Nightly at 2 AM America/Vancouver: rebuild when FrankenPress or caddy-dns/powerdns has a
 # new release. A tag that already exists in GHCR is skipped, so most nights do nothing.
@@ -17,14 +17,14 @@ on:
   # A Dockerfile change rebuilds the current tags (forced)
   push:
     branches: [main]
-    paths: [Dockerfile]
+    paths: [frankenpress/**]
 
 permissions:
   contents: read
 
 # One run at a time; a second one waits instead of building the same tag in parallel
 concurrency:
-  group: build
+  group: frankenpress
   cancel-in-progress: false
 
 env:
@@ -59,7 +59,7 @@ jobs:
       - name: Re-enable this workflow
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/build.yml/enable"
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/frankenpress.yml/enable"
 
   resolve:
     needs: when
@@ -154,7 +154,7 @@ jobs:
       - name: Build
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: frankenpress
           platforms: linux/${{ matrix.platform.arch }}
           load: true
           tags: test:${{ matrix.platform.arch }}
@@ -193,7 +193,7 @@ jobs:
         id: push
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: frankenpress
           platforms: linux/${{ matrix.platform.arch }}
           build-args: |
             FRANKENPRESS=${{ matrix.image.src }}
@@ -250,3 +250,23 @@ jobs:
             $refs
           docker buildx imagetools inspect "$IMAGE:${{ matrix.image.tag }}"
           echo "Published $IMAGE:${{ matrix.image.tag }}" >> "$GITHUB_STEP_SUMMARY"
+
+  # Heartbeat to an Uptime Kuma push monitor (secret KUMA_PUSH_FRANKENPRESS, the push URL
+  # without query string): up when every job succeeded or was skipped, down otherwise
+  notify:
+    needs: [when, resolve, build, publish]
+    if: always() && github.event_name != 'push' && needs.when.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Push to Uptime Kuma
+        env:
+          PUSH_URL: ${{ secrets.KUMA_PUSH_FRANKENPRESS }}
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+          BUILT: ${{ needs.resolve.outputs.any }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$PUSH_URL" ]; then echo "KUMA_PUSH_FRANKENPRESS not set; skipping"; exit 0; fi
+          if [ "$FAILED" = true ]; then status=down; msg="failed: $RUN_URL"
+          elif [ "$BUILT" = true ]; then status=up; msg="built new image"
+          else status=up; msg="up to date"; fi
+          curl -fsS -m 20 -X POST -G "$PUSH_URL" --data-urlencode "status=$status" --data-urlencode "msg=$msg"

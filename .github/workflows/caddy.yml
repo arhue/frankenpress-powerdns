@@ -1,0 +1,240 @@
+name: caddy
+
+# Nightly at 2 AM America/Vancouver: rebuild Caddy + PowerDNS + cache-handler when Caddy or
+# either module has a new release. A tag that already exists in GHCR is skipped.
+on:
+  schedule:
+    # Cron is UTC: 09:00 UTC is 2 AM in summer (PDT), 10:00 UTC in winter (PST). Both are
+    # scheduled; the "when" job lets through only the one that is 2 AM in Vancouver.
+    - cron: "0 9 * * *"
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if the tag already exists
+        type: boolean
+        default: false
+  # A change to the image rebuilds the current tag (forced)
+  push:
+    branches: [main]
+    paths: [caddy/**]
+
+permissions:
+  contents: read
+
+# One run at a time; a second one waits instead of building the same tag in parallel
+concurrency:
+  group: caddy
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/caddy-powerdns-cache
+
+jobs:
+  when:
+    runs-on: ubuntu-24.04
+    outputs:
+      go: ${{ steps.when.outputs.go }}
+    steps:
+      - name: Only the scheduled run that falls at 2 AM in Vancouver
+        id: when
+        run: |
+          hour=$(TZ=America/Vancouver date +%H)
+          # Scheduled runs can start late, so 2 AM to 2:59 counts (09:00 UTC is 1 AM in winter)
+          if [ "${{ github.event_name }}" != schedule ] || [ "$hour" = 02 ]; then go=true; else go=false; fi
+          echo "event ${{ github.event_name }}, Vancouver hour $hour: go=$go"
+          echo "go=$go" >> "$GITHUB_OUTPUT"
+
+  # GitHub disables scheduled workflows after 60 days without repository activity; most
+  # nights build nothing, so re-enable the workflow through the API to keep it alive.
+  keepalive:
+    needs: when
+    if: github.event_name == 'schedule' && needs.when.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - name: Re-enable this workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/caddy.yml/enable"
+
+  resolve:
+    needs: when
+    if: needs.when.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.resolve.outputs.build }}
+      caddy: ${{ steps.resolve.outputs.caddy }}
+      pdns: ${{ steps.resolve.outputs.pdns }}
+      cache: ${{ steps.resolve.outputs.cache }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Resolve versions and decide whether to build
+        id: resolve
+        env:
+          FORCE: ${{ github.event_name == 'push' || inputs.force == true }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          latest() {
+            git ls-remote --tags --refs "https://github.com/$1" | awk -F/ '{print $3}' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1
+          }
+          caddy=$(latest caddyserver/caddy); caddy=${caddy#v}
+          pdns=$(latest caddy-dns/powerdns)
+          cache=$(latest caddyserver/cache-handler)
+          echo "Caddy $caddy, caddy-dns/powerdns $pdns, cache-handler $cache"
+
+          # Official images appear a little after a Caddy release; try again tomorrow
+          for t in "$caddy-builder" "$caddy-alpine"; do
+            if ! docker manifest inspect "caddy:$t" >/dev/null 2>&1; then
+              echo "::notice::caddy:$t isn't published yet; not building tonight"
+              echo "build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
+          tag="${caddy}-powerdns-${pdns}-cache-${cache}"
+          echo "$IMAGE:$tag"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
+          if [ "$FORCE" != true ] && docker manifest inspect "$IMAGE:$tag" >/dev/null 2>&1; then
+            echo "exists, skipping"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+          { echo "caddy=$caddy"; echo "pdns=$pdns"; echo "cache=$cache"; echo "tag=$tag"; } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        platform:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      BUILD_ARGS: |
+        CADDY_VERSION=${{ needs.resolve.outputs.caddy }}
+        POWERDNS_VERSION=${{ needs.resolve.outputs.pdns }}
+        CACHE_HANDLER_VERSION=${{ needs.resolve.outputs.cache }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: caddy
+          platforms: linux/${{ matrix.platform.arch }}
+          load: true
+          tags: test:${{ matrix.platform.arch }}
+          build-args: ${{ env.BUILD_ARGS }}
+          cache-from: type=gha,scope=caddy-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,scope=caddy-${{ matrix.platform.arch }}
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          img=test:${{ matrix.platform.arch }}
+          docker run --rm "$img" caddy version
+          modules=$(docker run --rm "$img" caddy list-modules)
+          for m in dns.providers.powerdns http.handlers.cache; do
+            grep -qx "$m" <<<"$modules" || { echo "::error::module $m missing"; exit 1; }
+          done
+          # The second request must be a cache hit
+          c=$(docker run -d -p 8080:8080 -v "$PWD/caddy/smoke-test.Caddyfile:/etc/caddy/Caddyfile:ro" "$img")
+          for _ in $(seq 30); do curl -fs -o /dev/null http://localhost:8080/ && break; sleep 1; done
+          curl -fsS -o /dev/null http://localhost:8080/
+          headers=$(curl -fsS -D - -o /dev/null http://localhost:8080/)
+          docker logs "$c" 2>&1 | tail -10
+          docker rm -f "$c" >/dev/null
+          echo "$headers"
+          grep -qiE '^cache-status:.*hit' <<<"$headers" || { echo "::error::no cache hit"; exit 1; }
+
+      - name: Push by digest
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: caddy
+          platforms: linux/${{ matrix.platform.arch }}
+          build-args: ${{ env.BUILD_ARGS }}
+          cache-from: type=gha,scope=caddy-${{ matrix.platform.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Save digest
+        run: |
+          mkdir -p digests
+          echo "${{ steps.push.outputs.digest }}" > "digests/${{ matrix.platform.arch }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-caddy-${{ matrix.platform.arch }}
+          path: digests/*
+          retention-days: 1
+
+  publish:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-caddy-*
+          merge-multiple: true
+          path: digests
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Create multi-arch tags
+        run: |
+          set -euo pipefail
+          refs=$(for f in digests/*; do echo "$IMAGE@$(cat "$f")"; done)
+          docker buildx imagetools create \
+            -t "$IMAGE:${{ needs.resolve.outputs.tag }}" \
+            -t "$IMAGE:latest" \
+            $refs
+          docker buildx imagetools inspect "$IMAGE:${{ needs.resolve.outputs.tag }}"
+          echo "Published $IMAGE:${{ needs.resolve.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+
+  # Heartbeat to an Uptime Kuma push monitor (secret KUMA_PUSH_CADDY, the push URL without
+  # query string): up when every job succeeded or was skipped, down otherwise
+  notify:
+    needs: [when, resolve, build, publish]
+    if: always() && github.event_name != 'push' && needs.when.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Push to Uptime Kuma
+        env:
+          PUSH_URL: ${{ secrets.KUMA_PUSH_CADDY }}
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+          BUILT: ${{ needs.resolve.outputs.build }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$PUSH_URL" ]; then echo "KUMA_PUSH_CADDY not set; skipping"; exit 0; fi
+          if [ "$FAILED" = true ]; then status=down; msg="failed: $RUN_URL"
+          elif [ "$BUILT" = true ]; then status=up; msg="built new image"
+          else status=up; msg="up to date"; fi
+          curl -fsS -m 20 -X POST -G "$PUSH_URL" --data-urlencode "status=$status" --data-urlencode "msg=$msg"

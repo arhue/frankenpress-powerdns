@@ -1,0 +1,14 @@
+# Used by CI: the second request for / must be answered from the cache
+{
+	admin off
+	order cache before rewrite
+	cache {
+		ttl 60s
+	}
+}
+
+:8080 {
+	cache
+	header Cache-Control "public, max-age=60"
+	respond "hello from caddy" 200
+}
