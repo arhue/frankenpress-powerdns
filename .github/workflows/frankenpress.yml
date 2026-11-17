@@ -250,23 +250,3 @@ jobs:
             $refs
           docker buildx imagetools inspect "$IMAGE:${{ matrix.image.tag }}"
           echo "Published $IMAGE:${{ matrix.image.tag }}" >> "$GITHUB_STEP_SUMMARY"
-
-  # Heartbeat to an Uptime Kuma push monitor (secret KUMA_PUSH_FRANKENPRESS, the push URL
-  # without query string): up when every job succeeded or was skipped, down otherwise
-  notify:
-    needs: [when, resolve, build, publish]
-    if: always() && github.event_name != 'push' && needs.when.outputs.go == 'true'
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Push to Uptime Kuma
-        env:
-          PUSH_URL: ${{ secrets.KUMA_PUSH_FRANKENPRESS }}
-          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
-          BUILT: ${{ needs.resolve.outputs.any }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          if [ -z "$PUSH_URL" ]; then echo "KUMA_PUSH_FRANKENPRESS not set; skipping"; exit 0; fi
-          if [ "$FAILED" = true ]; then status=down; msg="failed: $RUN_URL"
-          elif [ "$BUILT" = true ]; then status=up; msg="built new image"
-          else status=up; msg="up to date"; fi
-          curl -fsS -m 20 -X POST -G "$PUSH_URL" --data-urlencode "status=$status" --data-urlencode "msg=$msg"

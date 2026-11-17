@@ -45,10 +45,13 @@ Each image has a GitHub Actions workflow that runs every night at 2 AM Pacific t
 3. smoke-tests each architecture:
    - **frankenpress:** the modules are present, PHP is the same version, WordPress answers;
    - **caddy:** the modules are present, and a repeated request is served from the cache;
-4. publishes both architectures under one tag;
-5. sends a heartbeat to an Uptime Kuma push monitor, if the repository secret
-   `KUMA_PUSH_FRANKENPRESS` / `KUMA_PUSH_CADDY` is set: up when the run succeeded (built or
-   nothing new), down with a link to the run when it failed.
+4. publishes both architectures under one tag.
+
+To monitor the builds, poll the GitHub API, e.g. with an Uptime Kuma JSON-query monitor on
+`https://api.github.com/repos/arhue/frankenpress-powerdns/actions/workflows/caddy.yml/runs?status=completed&per_page=1`
+and the expression
+`workflow_runs[0].conclusion = "success" and $toMillis(workflow_runs[0].updated_at) > $millis() - 108000000`
+(the latest run succeeded within 30 hours).
 
 ## Using DNS-01
 
