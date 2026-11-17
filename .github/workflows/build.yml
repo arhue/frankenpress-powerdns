@@ -74,8 +74,9 @@ jobs:
               continue
             fi
             entries+=("$(jq -nc --arg variant "$variant" --arg src "$src" --arg builder "$builder" \
-              --arg caddy "$caddy" --arg pdns "$pdns" --arg tag "$tag" --arg php "$php" \
-              '{variant:$variant, src:$src, builder:$builder, caddy:$caddy, pdns:$pdns, tag:$tag, php:$php}')")
+              --arg caddy "$caddy" --arg caddy_builder "caddy:${caddy#v}-builder" \
+              --arg pdns "$pdns" --arg tag "$tag" --arg php "$php" \
+              '{variant:$variant, src:$src, builder:$builder, caddy:$caddy, caddy_builder:$caddy_builder, pdns:$pdns, tag:$tag, php:$php}')")
           done
 
           if [ ${#entries[@]} -eq 0 ]; then
@@ -121,7 +122,7 @@ jobs:
           build-args: |
             FRANKENPRESS=${{ matrix.image.src }}
             FRANKENPHP_BUILDER=${{ matrix.image.builder }}
-            CADDY_BUILDER=caddy:${{ matrix.image.caddy }}-builder
+            CADDY_BUILDER=${{ matrix.image.caddy_builder }}
             CADDY_VERSION=${{ matrix.image.caddy }}
             POWERDNS_VERSION=${{ matrix.image.pdns }}
           cache-from: type=gha,scope=${{ matrix.image.variant }}-${{ matrix.platform.arch }}
@@ -158,7 +159,7 @@ jobs:
           build-args: |
             FRANKENPRESS=${{ matrix.image.src }}
             FRANKENPHP_BUILDER=${{ matrix.image.builder }}
-            CADDY_BUILDER=caddy:${{ matrix.image.caddy }}-builder
+            CADDY_BUILDER=${{ matrix.image.caddy_builder }}
             CADDY_VERSION=${{ matrix.image.caddy }}
             POWERDNS_VERSION=${{ matrix.image.pdns }}
           cache-from: type=gha,scope=${{ matrix.image.variant }}-${{ matrix.platform.arch }}
