@@ -1,22 +1,31 @@
 name: build
 
-# Nightly: rebuild when FrankenPress or caddy-dns/powerdns has a new release. A tag that
-# already exists in GHCR is skipped, so most nights do nothing.
+# Nightly at 2 AM America/Vancouver: rebuild when FrankenPress or caddy-dns/powerdns has a
+# new release. A tag that already exists in GHCR is skipped, so most nights do nothing.
 on:
   schedule:
-    - cron: "30 4 * * *"
+    # Cron is UTC: 09:00 UTC is 2 AM in summer (PDT), 10:00 UTC in winter (PST). Both are
+    # scheduled; the "when" job lets through only the one that is 2 AM in Vancouver.
+    - cron: "0 9 * * *"
+    - cron: "0 10 * * *"
   workflow_dispatch:
     inputs:
       force:
         description: Rebuild even if the tag already exists
         type: boolean
         default: false
+  # A Dockerfile change rebuilds the current tags (forced)
   push:
     branches: [main]
-    paths: [Dockerfile, .github/workflows/build.yml]
+    paths: [Dockerfile]
 
 permissions:
   contents: read
+
+# One run at a time; a second one waits instead of building the same tag in parallel
+concurrency:
+  group: build
+  cancel-in-progress: false
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/frankenpress-powerdns
@@ -24,7 +33,37 @@ env:
   VARIANTS: php-8.5-trixie
 
 jobs:
+  when:
+    runs-on: ubuntu-24.04
+    outputs:
+      go: ${{ steps.when.outputs.go }}
+    steps:
+      - name: Only the scheduled run that falls at 2 AM in Vancouver
+        id: when
+        run: |
+          hour=$(TZ=America/Vancouver date +%H)
+          # Scheduled runs can start late, so 2 AM to 2:59 counts (09:00 UTC is 1 AM in winter)
+          if [ "${{ github.event_name }}" != schedule ] || [ "$hour" = 02 ]; then go=true; else go=false; fi
+          echo "event ${{ github.event_name }}, Vancouver hour $hour: go=$go"
+          echo "go=$go" >> "$GITHUB_OUTPUT"
+
+  # GitHub disables scheduled workflows after 60 days without repository activity; most
+  # nights build nothing, so re-enable the workflow through the API to keep it alive.
+  keepalive:
+    needs: when
+    if: github.event_name == 'schedule' && needs.when.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - name: Re-enable this workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/build.yml/enable"
+
   resolve:
+    needs: when
+    if: needs.when.outputs.go == 'true'
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.resolve.outputs.matrix }}
