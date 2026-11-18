@@ -1,9 +1,15 @@
-# Used by CI: the second request for / must be answered from the cache
+# Used by CI: the second request for / must be answered from the cache (simplefs on disk)
 {
 	admin off
 	order cache before rewrite
 	cache {
 		ttl 60s
+		simplefs {
+			configuration {
+				path /tmp/cache
+				directory_size 10MB
+			}
+		}
 	}
 }
 

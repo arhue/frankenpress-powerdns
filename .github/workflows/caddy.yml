@@ -1,7 +1,7 @@
 name: caddy
 
-# Nightly at 2 AM America/Vancouver: rebuild Caddy + PowerDNS + cache-handler when Caddy or
-# either module has a new release. A tag that already exists in GHCR is skipped.
+# Nightly at 2 AM America/Vancouver: rebuild Caddy + PowerDNS + cache-handler (+ simplefs
+# storage) when Caddy or a module has a new release. A tag that already exists is skipped.
 on:
   schedule:
     # Cron is UTC: 09:00 UTC is 2 AM in summer (PDT), 10:00 UTC in winter (PST). Both are
@@ -68,6 +68,7 @@ jobs:
       caddy: ${{ steps.resolve.outputs.caddy }}
       pdns: ${{ steps.resolve.outputs.pdns }}
       cache: ${{ steps.resolve.outputs.cache }}
+      simplefs: ${{ steps.resolve.outputs.simplefs }}
       tag: ${{ steps.resolve.outputs.tag }}
     steps:
       - name: Resolve versions and decide whether to build
@@ -84,7 +85,11 @@ jobs:
           caddy=$(latest caddyserver/caddy); caddy=${caddy#v}
           pdns=$(latest caddy-dns/powerdns)
           cache=$(latest caddyserver/cache-handler)
-          echo "Caddy $caddy, caddy-dns/powerdns $pdns, cache-handler $cache"
+          # A Go submodule: tagged simplefs/caddy/vX.Y.Z in darkweak/storages
+          simplefs=$(git ls-remote --tags --refs https://github.com/darkweak/storages \
+            | sed 's#.*refs/tags/##' | grep -E '^simplefs/caddy/v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sed 's#^simplefs/caddy/##' | sort -V | tail -1)
+          echo "Caddy $caddy, caddy-dns/powerdns $pdns, cache-handler $cache, simplefs $simplefs"
 
           # Official images appear a little after a Caddy release; try again tomorrow
           for t in "$caddy-builder" "$caddy-alpine"; do
@@ -95,7 +100,7 @@ jobs:
             fi
           done
 
-          tag="${caddy}-powerdns-${pdns}-cache-${cache}"
+          tag="${caddy}-powerdns-${pdns}-cache-${cache}-simplefs-${simplefs}"
           echo "$IMAGE:$tag"
           echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
           if [ "$FORCE" != true ] && docker manifest inspect "$IMAGE:$tag" >/dev/null 2>&1; then
@@ -104,7 +109,7 @@ jobs:
           else
             echo "build=true" >> "$GITHUB_OUTPUT"
           fi
-          { echo "caddy=$caddy"; echo "pdns=$pdns"; echo "cache=$cache"; echo "tag=$tag"; } >> "$GITHUB_OUTPUT"
+          { echo "caddy=$caddy"; echo "pdns=$pdns"; echo "cache=$cache"; echo "simplefs=$simplefs"; echo "tag=$tag"; } >> "$GITHUB_OUTPUT"
 
   build:
     needs: resolve
@@ -124,6 +129,7 @@ jobs:
         CADDY_VERSION=${{ needs.resolve.outputs.caddy }}
         POWERDNS_VERSION=${{ needs.resolve.outputs.pdns }}
         CACHE_HANDLER_VERSION=${{ needs.resolve.outputs.cache }}
+        SIMPLEFS_VERSION=${{ needs.resolve.outputs.simplefs }}
     steps:
       - uses: actions/checkout@v4
 
@@ -152,18 +158,21 @@ jobs:
           img=test:${{ matrix.platform.arch }}
           docker run --rm "$img" caddy version
           modules=$(docker run --rm "$img" caddy list-modules)
-          for m in dns.providers.powerdns http.handlers.cache; do
+          for m in dns.providers.powerdns http.handlers.cache storages.cache.simplefs; do
             grep -qx "$m" <<<"$modules" || { echo "::error::module $m missing"; exit 1; }
           done
-          # The second request must be a cache hit
+          # The second request must be a cache hit, stored on disk by simplefs
           c=$(docker run -d -p 8080:8080 -v "$PWD/caddy/smoke-test.Caddyfile:/etc/caddy/Caddyfile:ro" "$img")
           for _ in $(seq 30); do curl -fs -o /dev/null http://localhost:8080/ && break; sleep 1; done
           curl -fsS -o /dev/null http://localhost:8080/
           headers=$(curl -fsS -D - -o /dev/null http://localhost:8080/)
+          files=$(docker exec "$c" find /tmp/cache -type f | wc -l)
           docker logs "$c" 2>&1 | tail -10
           docker rm -f "$c" >/dev/null
           echo "$headers"
           grep -qiE '^cache-status:.*hit' <<<"$headers" || { echo "::error::no cache hit"; exit 1; }
+          echo "files in the simplefs directory: $files"
+          [ "$files" -gt 0 ] || { echo "::error::nothing stored on disk by simplefs"; exit 1; }
 
       - name: Push by digest
         id: push
